@@ -207,6 +207,7 @@
   .row-btn{padding:6px 12px;font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.05em;text-transform:uppercase;border-radius:2px;border:1px solid var(--line);background:var(--stone);color:var(--ink-soft);}
   .row-btn:hover{border-color:var(--brass);color:var(--ink);}
   .row-btn.danger{border-color:var(--clay);color:var(--clay);} .row-btn.danger:hover{background:var(--clay);color:#fff;}
+  .row-btn-urgent{border-color:var(--clay);color:#fff;background:var(--clay);} .row-btn-urgent:hover{opacity:.85;}
   .toggle-switch{width:36px;height:20px;border-radius:20px;background:var(--stone-dim);border:1px solid var(--line);position:relative;display:inline-block;}
   .toggle-switch::after{content:"";position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:1px;left:1px;box-shadow:0 1px 3px rgba(0,0,0,.3);transition:.15s;}
   .toggle-switch.on{background:var(--forest);border-color:var(--forest);}
@@ -464,8 +465,8 @@
           <span class="head-badge forest" id="inventoryBadge">Loading…</span>
         </div>
         <table class="data-table">
-          <thead><tr><th>Product</th><th>Category</th><th>Stock</th><th>Reorder At</th><th>Price</th><th>VAT</th></tr></thead>
-          <tbody id="inventoryBody"><tr><td colspan="6">Loading…</td></tr></tbody>
+          <thead><tr><th>Product</th><th>Category</th><th>Stock</th><th>Reorder At</th><th>Price</th><th>VAT</th><th></th></tr></thead>
+          <tbody id="inventoryBody"><tr><td colspan="7">Loading…</td></tr></tbody>
         </table>
       </div>
       <div class="plate form-side">
@@ -634,6 +635,40 @@
     <div style="display:flex;gap:10px;justify-content:flex-end;">
       <button class="row-btn" onclick="closePaymentHistory()" style="padding:8px 16px;">Close</button>
       <button class="row-btn" id="phRecordBtn" style="padding:8px 16px;background:var(--teal);color:var(--paper);border:none;">Record New Payment</button>
+    </div>
+  </div>
+</div>
+
+<!-- Reorder modal — opened from the Inventory table when a product is at or
+     below its reorder level. Records new stock as it arrives (e.g. "50 more
+     Mariya Handwash Liquid Soap just arrived from the supplier") and writes
+     straight to branch_stock, so it's live on the cashier's sales screen the
+     moment it's saved — no separate sync step needed. -->
+<div id="reorderOverlay" style="display:none;position:fixed;inset:0;background:rgba(22,35,61,.55);z-index:1300;align-items:center;justify-content:center;">
+  <div style="background:var(--paper);border:1px solid var(--brass);border-radius:4px;padding:24px;width:400px;max-width:92vw;box-shadow:0 12px 40px rgba(22,35,61,.35);">
+    <div style="font-family:'Fraunces',serif;font-weight:700;font-size:17px;color:var(--ink);margin-bottom:4px;" id="reoProductName">—</div>
+    <div style="font-size:12px;color:var(--ink-soft);margin-bottom:18px;" id="reoProductMeta">—</div>
+
+    <div class="form-field" style="margin-bottom:14px;">
+      <label>Branch receiving this stock</label>
+      <select id="reoBranch" style="width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid var(--stone-dim);border-radius:3px;font-family:inherit;font-size:14px;color:var(--ink);"></select>
+    </div>
+
+    <div class="form-field" style="margin-bottom:14px;">
+      <label>Quantity reordered / received</label>
+      <input type="number" id="reoQty" min="1" placeholder="e.g. 50" style="width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid var(--stone-dim);border-radius:3px;font-family:inherit;font-size:14px;color:var(--ink);">
+    </div>
+
+    <div class="form-field" style="margin-bottom:18px;">
+      <label>Note (optional — e.g. supplier or invoice ref)</label>
+      <input type="text" id="reoNote" placeholder="e.g. Restocked from Cosmos Traders" style="width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid var(--stone-dim);border-radius:3px;font-family:inherit;font-size:14px;color:var(--ink);">
+    </div>
+
+    <div id="reoNewTotal" style="font-size:12.5px;color:var(--ink-soft);margin-bottom:18px;"></div>
+
+    <div style="display:flex;gap:10px;justify-content:flex-end;">
+      <button class="row-btn" onclick="closeReorderModal()" style="padding:8px 16px;">Cancel</button>
+      <button class="row-btn" id="reoSaveBtn" onclick="saveReorder()" style="padding:8px 16px;background:var(--forest);color:var(--paper);border:none;">Save Reorder</button>
     </div>
   </div>
 </div>
@@ -953,16 +988,18 @@
       document.getElementById('inventoryBadge').textContent = `${products.length} products · ${lowStock.length} low stock`;
       document.getElementById('inventoryBody').innerHTML = products.map(p => {
         const qty = stockByProduct.get(p.id) ?? 0;
-        const pillClass = qty <= p.reorder_level ? 'pill-red' : (qty <= p.reorder_level*2 ? 'pill-amber' : 'pill-green');
+        const needsReorder = qty <= p.reorder_level;
+        const pillClass = needsReorder ? 'pill-red' : (qty <= p.reorder_level*2 ? 'pill-amber' : 'pill-green');
         return `<tr>
           <td><b>${p.name}</b><br><small style="color:var(--ink-soft);">${p.sku||'—'}</small></td>
           <td>${p.category_name || 'Uncategorized'}</td>
-          <td><span class="pill ${pillClass}">${qty}</span></td>
+          <td><span class="pill ${pillClass}" ${needsReorder ? `onclick="openReorderModal(${p.id})" style="cursor:pointer;" title="Click to record a reorder"` : ''}>${qty}</span></td>
           <td>${p.reorder_level}</td>
           <td>${fmt(p.selling_price)}</td>
           <td>${p.vat_applicable ? p.vat_rate+'%' : '—'}</td>
+          <td><button class="row-btn ${needsReorder ? 'row-btn-urgent' : ''}" onclick="openReorderModal(${p.id})">${needsReorder ? 'Reorder' : 'Restock'}</button></td>
         </tr>`;
-      }).join('') || `<tr><td colspan="6">No products yet.</td></tr>`;
+      }).join('') || `<tr><td colspan="7">No products yet.</td></tr>`;
     }catch(err){
       showToast('Could not load inventory: ' + err.message);
     }
@@ -1109,6 +1146,80 @@
       document.getElementById('phList').innerHTML = `<div style="font-size:12.5px;color:var(--clay);">Could not load payment history: ${err.message}</div>`;
     }
   }
+  // ================= REORDER STOCK =================
+  let reorderProduct = null; // { id, name, sku, reorder_level }
+  let reorderCurrentQtyByBranch = new Map(); // branchId -> qty on hand, refreshed each time the modal opens
+
+  async function openReorderModal(productId){
+    const products = await window.pos.products.list({activeOnly:true});
+    reorderProduct = products.find(p => p.id === productId);
+    if(!reorderProduct){ showToast('Product not found.'); return; }
+
+    document.getElementById('reoProductName').textContent = reorderProduct.name;
+    document.getElementById('reoProductMeta').textContent = `${reorderProduct.category_name || 'Uncategorized'} · Reorder level: ${reorderProduct.reorder_level}`;
+    document.getElementById('reoQty').value = '';
+    document.getElementById('reoNote').value = '';
+    document.getElementById('reoNewTotal').textContent = '';
+
+    // Populate branches + current stock per branch so the owner can see exactly
+    // what each branch has before deciding where the new stock should go.
+    reorderCurrentQtyByBranch = new Map();
+    await Promise.all(BRANCHES.map(async b => {
+      const rows = await window.pos.stock.branchStock(b.id);
+      const row = rows.find(r => r.product_id === productId);
+      reorderCurrentQtyByBranch.set(b.id, row ? row.quantity_on_hand : 0);
+    }));
+    const branchSel = document.getElementById('reoBranch');
+    branchSel.innerHTML = BRANCHES.filter(b => b.is_active).map(b =>
+      `<option value="${b.id}">${b.name} — currently ${reorderCurrentQtyByBranch.get(b.id) ?? 0} in stock</option>`
+    ).join('');
+    branchSel.onchange = updateReorderPreview;
+    document.getElementById('reoQty').oninput = updateReorderPreview;
+    updateReorderPreview();
+
+    document.getElementById('reorderOverlay').style.display = 'flex';
+  }
+
+  function updateReorderPreview(){
+    const branchId = Number(document.getElementById('reoBranch').value);
+    const qty = Number(document.getElementById('reoQty').value) || 0;
+    const current = reorderCurrentQtyByBranch.get(branchId) ?? 0;
+    document.getElementById('reoNewTotal').textContent = qty > 0
+      ? `New stock on hand: ${current} + ${qty} = ${current + qty}`
+      : '';
+  }
+
+  function closeReorderModal(){
+    document.getElementById('reorderOverlay').style.display = 'none';
+    reorderProduct = null;
+  }
+
+  async function saveReorder(){
+    if(!reorderProduct) return;
+    const branchId = Number(document.getElementById('reoBranch').value);
+    const qty = Number(document.getElementById('reoQty').value);
+    const note = document.getElementById('reoNote').value.trim();
+    if(!qty || qty <= 0){ showToast('Enter how many were reordered.'); return; }
+
+    const branchName = BRANCHES.find(b => b.id === branchId)?.name || '';
+    const reason = `Reorder received${note ? ' — ' + note : ''}`;
+    const btn = document.getElementById('reoSaveBtn');
+    btn.disabled = true;
+    try{
+      // This writes straight to branch_stock — the same table the cashier's
+      // sales screen reads from — so the extra units are available to sell
+      // the instant this save completes, no separate sync step.
+      await window.pos.stock.adjust(branchId, reorderProduct.id, qty, reason);
+      showToast(`Recorded ${qty} more ${reorderProduct.name} at ${branchName}. Available on the till now.`);
+      closeReorderModal();
+      await loadInventory();
+    }catch(err){
+      showToast('Could not record reorder: ' + err.message);
+    }finally{
+      btn.disabled = false;
+    }
+  }
+
   function closePaymentHistory(){
     document.getElementById('paymentHistoryOverlay').style.display = 'none';
     currentHistoryCustomerId = null;
