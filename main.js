@@ -18,6 +18,7 @@ const os = require('os');
 const Database = require('better-sqlite3');
 const ExcelJS = require('exceljs');
 const PDFDocument = require('pdfkit');
+const { ThermalPrinter, PrinterTypes } = require('node-thermal-printer');
 const CH = require('./ipc-channels');
 const { getMachineId } = require('./licensing/machine-id');
 const { validateLicenseKey } = require('./licensing/validate-key');
@@ -83,6 +84,12 @@ function runMigrations() {
   const settingsCols = db.prepare("PRAGMA table_info(settings)").all().map(c => c.name);
   if (!settingsCols.includes('receipt_contact_line')) {
     db.exec("ALTER TABLE settings ADD COLUMN receipt_contact_line TEXT DEFAULT 'Call Us/WhatsApp/SMS: 0728752018. Asante Sana'");
+  }
+  if (!settingsCols.includes('printer_port')) {
+    db.exec("ALTER TABLE settings ADD COLUMN printer_port TEXT");
+  }
+  if (!settingsCols.includes('printer_width')) {
+    db.exec("ALTER TABLE settings ADD COLUMN printer_width INTEGER NOT NULL DEFAULT 32");
   }
   // Fill in the contact line / phone for databases that already had a settings
   // row before this column existed (ALTER TABLE ADD COLUMN with a DEFAULT only
@@ -825,7 +832,7 @@ function registerIpcHandlers() {
   ipcMain.handle(CH.SETTINGS.GET, () => db.prepare('SELECT * FROM settings WHERE id = 1').get());
   ipcMain.handle(CH.SETTINGS.UPDATE, (e, changes) => {
     requireAdmin();
-    const allowed = ['business_name', 'address', 'phone', 'tax_id', 'logo_path', 'currency_symbol', 'default_tax_rate', 'receipt_footer', 'receipt_contact_line', 'low_stock_default', 'theme', 'sales_target_monthly'];
+    const allowed = ['business_name', 'address', 'phone', 'tax_id', 'logo_path', 'currency_symbol', 'default_tax_rate', 'receipt_footer', 'receipt_contact_line', 'printer_port', 'printer_width', 'low_stock_default', 'theme', 'sales_target_monthly'];
     const fields = Object.keys(changes || {}).filter(k => allowed.includes(k));
     if (fields.length === 0) throw new Error('No valid settings fields to update.');
     const setSql = fields.map(f => `${f} = ?`).join(', ') + ", updated_at = datetime('now')";
@@ -844,21 +851,95 @@ function registerIpcHandlers() {
   });
 
   // ===== PRINTER =====
-  // Real ESC/POS wiring depends on the physical printer's connection (USB/serial/network)
-  // and is best finished once there's real hardware to test against. These handlers keep
-  // the renderer's calls working today by returning a clear, honest status instead of
-  // silently pretending to print.
+  // Direct ESC/POS printing over the printer's COM port (USB or Bluetooth SPP),
+  // via node-thermal-printer. This bypasses Windows' GDI print pipeline entirely —
+  // no "Generic / Text Only" driver needed, no page-size mismatch, no overlapping
+  // text and no wasted paper from an assumed full-page feed. settings.printer_port
+  // holds a value like '\\.\COM5' (see Settings → Receipt Printer in the dashboard);
+  // settings.printer_width is the character width for the paper (32 for 58mm).
+  function getReceiptPrinter(settings) {
+    if (!settings.printer_port) return null;
+    return new ThermalPrinter({
+      type: PrinterTypes.EPSON,
+      interface: settings.printer_port,
+      width: settings.printer_width || 32,
+      removeSpecialCharacters: false,
+      options: { timeout: 5000 },
+    });
+  }
+
+  function money(settings, amount) {
+    return `${settings.currency_symbol} ${Number(amount).toFixed(0)}`;
+  }
+
   ipcMain.handle(CH.PRINTER.LIST, () => {
-    return { configured: false, printers: [], note: 'No thermal printer configured yet. Add one from Settings once node-thermal-printer is wired to your hardware.' };
+    const settings = db.prepare('SELECT * FROM settings WHERE id = 1').get();
+    if (!settings.printer_port) {
+      return { configured: false, printers: [], note: 'No thermal printer configured. Set the COM port in Settings → Receipt Printer.' };
+    }
+    return { configured: true, printers: [{ name: 'Receipt Printer', port: settings.printer_port, width: settings.printer_width }], note: null };
   });
-  ipcMain.handle(CH.PRINTER.PRINT_RECEIPT, (e, { saleId }) => {
+
+  ipcMain.handle(CH.PRINTER.PRINT_RECEIPT, async (e, { saleId }) => {
     requireSession();
-    const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(saleId);
+    const settings = db.prepare('SELECT * FROM settings WHERE id = 1').get();
+    const sale = db.prepare(`
+      SELECT sa.*, u.name AS cashier_name, b.name AS branch_name
+      FROM sales sa JOIN users u ON u.id = sa.user_id JOIN branches b ON b.id = sa.branch_id
+      WHERE sa.id = ?
+    `).get(saleId);
     if (!sale) throw new Error('Sale not found.');
-    return { printed: false, note: 'No printer configured — showing on-screen receipt only.' };
+    sale.items = db.prepare(`
+      SELECT si.*, p.name AS product_name FROM sale_items si JOIN products p ON p.id = si.product_id WHERE si.sale_id = ?
+    `).all(saleId);
+
+    const printer = getReceiptPrinter(settings);
+    if (!printer) {
+      return { printed: false, note: 'No thermal printer configured — add the COM port in Settings → Receipt Printer.' };
+    }
+
+    try {
+      printer.clear();
+      printer.alignCenter();
+      printer.bold(true);
+      printer.println(settings.business_name || 'Paul Enterprises');
+      printer.bold(false);
+      printer.println('Official Sales Receipt');
+      printer.println(`Receipt No. ${sale.receipt_no} \u00b7 ${sale.payment_method}`);
+      printer.drawLine();
+
+      printer.alignLeft();
+      sale.items.forEach(it => {
+        printer.leftRight(`${it.product_name} x${it.quantity}`, money(settings, it.line_total));
+        printer.println(`  ${it.vat_rate > 0 ? `VAT ${it.vat_rate}% incl.` : 'VAT exempt'}`);
+      });
+      printer.drawLine();
+
+      printer.leftRight('Subtotal', money(settings, sale.subtotal));
+      printer.leftRight('VAT', money(settings, sale.tax));
+      printer.leftRight('Discount', `- ${money(settings, sale.discount)}`);
+      printer.bold(true);
+      printer.setTextDoubleHeight();
+      printer.leftRight('Total', money(settings, sale.total));
+      printer.setTextNormal();
+      printer.bold(false);
+
+      printer.alignCenter();
+      printer.newLine();
+      printer.println(`Cashier: ${sale.cashier_name} \u00b7 ${sale.branch_name}`);
+      printer.println(settings.receipt_footer || 'Thank you for shopping with us!');
+      printer.println(settings.receipt_contact_line || '');
+      printer.cut();
+
+      await printer.execute();
+      return { printed: true, note: null };
+    } catch (err) {
+      return { printed: false, note: `Print failed: ${err.message}` };
+    }
   });
+
   ipcMain.handle(CH.PRINTER.PRINT_REPORT, () => {
-    return { printed: false, note: 'No printer configured.' };
+    return { printed: false, note: 'Report printing to the thermal receipt printer isn\'t supported — use Export PDF/Excel from Reports instead.' };
   });
 
   // ===== LICENSING =====

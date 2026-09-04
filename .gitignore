@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+
+# Build output
+release/
+dist/
+
+# Never commit the license-signing private key — see licensing/keys-README.md
+licensing/keys/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.log
